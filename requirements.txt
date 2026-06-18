@@ -3,3 +3,4 @@ edge-tts
 pysubs2
 pydub
 google-genai
+audioop-lts

@@ -9,6 +9,9 @@ import tempfile
 import re
 import json
 import time
+import uuid
+import shutil
+import threading
 
 try:
     from google import genai
@@ -54,10 +57,108 @@ def is_valid_srt_filename(filename: str) -> bool:
 
 
 # =====================================================================
+# BACKGROUND JOB STORE
+# ---------------------------------------------------------------------
+# Why this exists: iOS Safari aggressively suspends/unloads background
+# tabs to save memory. When the user switches tab/app and comes back,
+# Safari does a FULL page reload — a brand new Streamlit session, so
+# anything kept in st.session_state (progress, results) is lost.
+#
+# Fix: run the actual long-running work (translate / TTS) in a plain
+# background thread that is NOT tied to the browser session, and persist
+# its progress + result to disk under a job_id. The job_id itself is
+# stored in the URL's query string (st.query_params), which iOS Safari
+# *does* preserve across its forced reloads. So after a reload, the app
+# reads the job_id back from the URL, looks up its status on disk, and
+# resumes showing progress / the finished result — the work itself never
+# stopped, since it kept running server-side the whole time.
+# =====================================================================
+
+JOBS_DIR = os.path.join(tempfile.gettempdir(), "srt_tool_jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+
+def _job_dir(job_id: str) -> str:
+    path = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _status_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), "status.json")
+
+
+def write_job_status(job_id: str, **updates) -> None:
+    """Atomically merge `updates` into this job's status.json on disk."""
+    path = _status_path(job_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data.update(updates)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def read_job_status(job_id: str):
+    path = _status_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_job_file(job_id: str, filename: str, data: bytes) -> None:
+    with open(os.path.join(_job_dir(job_id), filename), "wb") as f:
+        f.write(data)
+
+
+def load_job_file(job_id: str, filename: str):
+    path = os.path.join(_job_dir(job_id), filename)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def new_job_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def cleanup_old_jobs(max_age_seconds: int = 6 * 3600) -> None:
+    """Best-effort cleanup so /tmp doesn't grow unbounded over many sessions."""
+    now = time.time()
+    try:
+        for name in os.listdir(JOBS_DIR):
+            path = os.path.join(JOBS_DIR, name)
+            try:
+                if os.path.isdir(path) and (now - os.path.getmtime(path)) > max_age_seconds:
+                    shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+cleanup_old_jobs()
+
+
+# =====================================================================
 # TTS FUNCTIONS
 # =====================================================================
 
-async def process_srt_to_mp3(srt_content, voice, rate, pitch):
+async def process_srt_to_mp3(srt_content, voice, rate, pitch, on_progress=None):
+    """
+    on_progress(fraction: float) is called after each line instead of
+    updating a Streamlit progress bar directly — this lets the function
+    run inside a background thread, decoupled from any browser session.
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tmp_srt:
         tmp_srt.write(srt_content)
         tmp_srt_path = tmp_srt.name
@@ -68,7 +169,6 @@ async def process_srt_to_mp3(srt_content, voice, rate, pitch):
 
     base_duration = subs[-1].end + 30000
     combined_audio = AudioSegment.silent(duration=base_duration)
-    progress_bar = st.progress(0)
     total_lines = len(subs)
     actual_end_time = 0
 
@@ -98,7 +198,8 @@ async def process_srt_to_mp3(srt_content, voice, rate, pitch):
                     pass
         except Exception as e:
             raise RuntimeError(f"❌ Error at SRT line {i+1}: {e}") from e
-        progress_bar.progress((i + 1) / total_lines)
+        if on_progress:
+            on_progress((i + 1) / total_lines)
 
     combined_audio = combined_audio[:actual_end_time + 1000]
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
@@ -237,8 +338,8 @@ def translate_batch(client, items: list, model: str, glossary: dict = None) -> d
 
 
 def extract_glossary_from_translation(client, model: str,
-                                       english_lines: list[str],
-                                       khmer_lines: list[str],
+                                       english_lines: list,
+                                       khmer_lines: list,
                                        existing_glossary: dict) -> dict:
     """
     Ask Gemini to extract character names, place names, and key recurring terms
@@ -282,13 +383,18 @@ def extract_glossary_from_translation(client, model: str,
         return existing_glossary
 
 
-def translate_srt(srt_bytes: bytes, api_key: str, progress_bar, status_text,
+def translate_srt(srt_bytes: bytes, api_key: str,
+                  on_progress=None, on_status=None,
                   remove_ass: bool = True, remove_html: bool = True,
                   remove_brackets: bool = True, model: str = GEMINI_MODEL,
-                  glossary: dict = None) -> tuple[bytes, dict]:
+                  glossary: dict = None):
     """
     Full pipeline: parse → filter music → clean → batch-translate → SRT bytes.
     Returns (srt_bytes, updated_glossary).
+
+    on_progress(fraction: float) and on_status(message: str) are plain
+    callbacks instead of direct Streamlit widget calls, so this function
+    can be run inside a background thread (no Streamlit context needed).
     """
     if not GENAI_AVAILABLE:
         raise RuntimeError(
@@ -298,6 +404,14 @@ def translate_srt(srt_bytes: bytes, api_key: str, progress_bar, status_text,
 
     if glossary is None:
         glossary = {}
+
+    def _status(msg):
+        if on_status:
+            on_status(msg)
+
+    def _progress(frac):
+        if on_progress:
+            on_progress(frac)
 
     client = genai.Client(api_key=api_key)
 
@@ -344,12 +458,10 @@ def translate_srt(srt_bytes: bytes, api_key: str, progress_bar, status_text,
         end = min(start + BATCH_SIZE, total)
         batch = [(start + i, valid[start + i][1]) for i in range(end - start)]
 
-        status_text.text(
-            f"⏳ កំពុងបកប្រែ {start + 1}–{end} / {total} បន្ទាត់  ({model})"
-        )
+        _status(f"⏳ កំពុងបកប្រែ {start + 1}–{end} / {total} បន្ទាត់  ({model})")
         result = translate_batch(client, batch, model, glossary=glossary)
         all_translations.update(result)
-        progress_bar.progress((b + 1) / n_batches)
+        _progress((b + 1) / n_batches)
 
     # ── Build output SRT ────────────────────────────────────────────
     out = SSAFile()
@@ -362,13 +474,69 @@ def translate_srt(srt_bytes: bytes, api_key: str, progress_bar, status_text,
             out.append(SSAEvent(start=sub.start, end=sub.end, text=khmer))
 
     # ── Extract & update glossary ───────────────────────────────────
-    status_text.text("🔍 កំពុងទាញ Glossary ចេញពី EP នេះ...")
+    _status("🔍 កំពុងទាញ Glossary ចេញពី EP នេះ...")
     updated_glossary = extract_glossary_from_translation(
         client, model, english_lines, khmer_lines, glossary
     )
 
-    status_text.text("✅ ការបកប្រែបានសម្រេច!")
+    _status("✅ ការបកប្រែបានសម្រេច!")
     return out.to_string("srt").encode("utf-8"), updated_glossary
+
+
+# =====================================================================
+# BACKGROUND JOB RUNNERS
+# (executed inside threading.Thread — no Streamlit calls in here)
+# =====================================================================
+
+def _run_translate_job(job_id, srt_bytes, api_key, remove_ass, remove_html,
+                        remove_brackets, model, glossary, out_name):
+    def on_progress(frac):
+        write_job_status(job_id, progress=round(float(frac), 4))
+
+    def on_status(msg):
+        write_job_status(job_id, message=msg)
+
+    try:
+        result_bytes, updated_glossary = translate_srt(
+            srt_bytes, api_key,
+            on_progress=on_progress, on_status=on_status,
+            remove_ass=remove_ass, remove_html=remove_html,
+            remove_brackets=remove_brackets, model=model, glossary=glossary,
+        )
+        save_job_file(job_id, "result.srt", result_bytes)
+        save_job_file(
+            job_id, "glossary.json",
+            json.dumps(updated_glossary, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        write_job_status(
+            job_id, status="done", progress=1.0,
+            message="✅ ការបកប្រែបានសម្រេច!",
+            out_name=out_name, glossary_count=len(updated_glossary),
+        )
+    except Exception as e:
+        write_job_status(job_id, status="error", error=str(e))
+
+
+def _run_tts_job(job_id, srt_bytes, voice, rate, pitch, mp3_name):
+    def on_progress(frac):
+        write_job_status(job_id, progress=round(float(frac), 4))
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result_path = loop.run_until_complete(
+            process_srt_to_mp3(srt_bytes, voice, rate, pitch, on_progress=on_progress)
+        )
+        with open(result_path, "rb") as f:
+            audio_bytes = f.read()
+        os.remove(result_path)
+        save_job_file(job_id, "result.mp3", audio_bytes)
+        write_job_status(
+            job_id, status="done", progress=1.0,
+            message="✅ ការបំប្លែងជោគជ័យ!", out_name=mp3_name,
+        )
+    except Exception as e:
+        write_job_status(job_id, status="error", error=str(e))
 
 
 # =====================================================================
@@ -377,10 +545,6 @@ def translate_srt(srt_bytes: bytes, api_key: str, progress_bar, status_text,
 
 if "glossary" not in st.session_state:
     st.session_state.glossary = {}  # {english: khmer}
-if "translation_result" not in st.session_state:
-    st.session_state.translation_result = None  # (bytes, out_name, updated_glossary)
-if "tts_result" not in st.session_state:
-    st.session_state.tts_result = None  # (bytes, mp3_name)
 
 
 # ── Sidebar ─────────────────────────────────────────────────────────
@@ -424,6 +588,7 @@ with st.sidebar:
     }
     st.caption(f"✅ {model_labels.get(selected_model, selected_model)}")
     st.info("⚡ Auto-retry 5 ដង ប្រសិនបើ server busy (503)")
+    st.success("🛰️ ការងាររត់នៅ server — ប្តូរ tab/app បានដោយសុវត្ថិភាព")
 
     # ── Glossary Panel ───────────────────────────────────────────────
     st.markdown("---")
@@ -553,112 +718,137 @@ with tab_translate:
 | 🏷️ Tags | `{\\an8}` · `<i>` · `[...]` → auto-remove |
 | 📖 Glossary | ឈ្មោះ + ពាក្យ consistent រៀងរាល់ EP |
 | ➕ Manual Add | បន្ថែមពាក្យដៃ ឬ កែ Glossary |
+| 🛰️ Server job | ដំណើរការនៅ server — ប្តូរ tab/app បានដោយសុវត្ថិភាព |
 """
         )
 
-    # NOTE: `type=` is intentionally omitted here (was `type=["srt"]`).
-    # iOS Safari/WebKit has a known bug where a custom `accept` extension
-    # like `.srt` (no registered iOS UTI) makes the Files picker show the
-    # file greyed-out / unselectable. We accept any file and validate the
-    # extension ourselves right below instead.
-    uploaded_srt_raw = st.file_uploader(
-        "📂 ជ្រើស .srt (English)",
-        key="translate_uploader",
-    )
+    job_translate_id = st.query_params.get("job_translate")
 
-    uploaded_srt = None
-    if uploaded_srt_raw is not None:
-        if is_valid_srt_filename(uploaded_srt_raw.name):
-            uploaded_srt = uploaded_srt_raw
-        else:
-            st.error(
-                f"❌ ឯកសារ **{uploaded_srt_raw.name}** មិនមែនជា `.srt` ទេ។ "
-                "សូមជ្រើស file ដែលមាន extension `.srt`។"
+    if job_translate_id:
+        status = read_job_status(job_translate_id)
+
+        if status is None:
+            st.warning("⚠️ រកមិនឃើញការងារនេះទេ (server restart ឬផុតកំណត់)។ សូមចាប់ផ្តើមឡើងវិញ។")
+            if st.button("🆕 ការងារថ្មី", key="reset_translate_missing"):
+                del st.query_params["job_translate"]
+                st.rerun()
+
+        elif status.get("status") == "running":
+            st.info(
+                "🔄 កំពុងបកប្រែនៅលើ server... \n\n"
+                "✅ អ្នកអាចប្តូរទៅ tab ឬ app ផ្សេងបានដោយសុវត្ថិភាព — "
+                "ការងារនឹងបន្តដំណើរការ ហើយលទ្ធផលនឹងបង្ហាញពេលអ្នកត្រឡប់មកវិញ។"
             )
+            st.progress(status.get("progress", 0.0))
+            st.caption(status.get("message", ""))
+            # Poll for updates every 3s. This also means: even if iOS forces
+            # a real page reload while we're "waiting", the result is the same —
+            # we just re-read status.json and show progress again.
+            st.markdown('<meta http-equiv="refresh" content="3">', unsafe_allow_html=True)
 
-    if uploaded_srt:
-        base = os.path.splitext(uploaded_srt.name)[0]
-        out_name = f"{base}_KH.srt"
-        st.info(f"📄 **{uploaded_srt.name}**  →  **{out_name}**")
+        elif status.get("status") == "error":
+            st.error(f"❌ មានបញ្ហា: {status.get('error', 'Unknown error')}")
+            if st.button("🔁 ព្យាយាមម្តងទៀត", key="retry_translate"):
+                del st.query_params["job_translate"]
+                st.rerun()
 
-        st.markdown("**🏷️ ជ្រើសរើស Tags ដែលចង់លុប:**")
-        tc1, tc2, tc3 = st.columns(3)
-        with tc1:
-            opt_ass = st.checkbox("`{\\an8}` ASS/SSA tags", value=True, key="opt_ass")
-        with tc2:
-            opt_html = st.checkbox("`<i>` `</i>` HTML tags", value=True, key="opt_html")
-        with tc3:
-            opt_brackets = st.checkbox("`[...]` Bracket text", value=True, key="opt_brackets")
+        elif status.get("status") == "done":
+            out_name = status.get("out_name", "result_KH.srt")
+            glossary_count = status.get("glossary_count", 0)
+            result_bytes = load_job_file(job_translate_id, "result.srt")
+            glossary_bytes = load_job_file(job_translate_id, "glossary.json")
 
-        if st.button("🔄 ចាប់ផ្តើមបកប្រែ", type="primary", key="btn_translate"):
-            # Clear previous result when starting new translation
-            st.session_state.translation_result = None
-            key = gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
-            if not key:
-                st.error(
-                    "❌ សូមដាក់ **Google Gemini API Key** ក្នុង Sidebar។\n\n"
-                    "យក Key ឥតគិតថ្លៃ: https://aistudio.google.com"
-                )
-                st.stop()
+            if glossary_bytes:
+                try:
+                    st.session_state.glossary = json.loads(glossary_bytes.decode("utf-8"))
+                except Exception:
+                    pass
 
-            pb = st.progress(0)
-            status = st.empty()
-
-            try:
-                result_bytes, updated_glossary = translate_srt(
-                    uploaded_srt.read(),
-                    key,
-                    pb,
-                    status,
-                    remove_ass=opt_ass,
-                    remove_html=opt_html,
-                    remove_brackets=opt_brackets,
-                    model=selected_model,
-                    glossary=st.session_state.glossary,
-                )
-
-                # Update session glossary and store result persistently
-                st.session_state.glossary = updated_glossary
-                st.session_state.translation_result = (result_bytes, out_name, updated_glossary)
-
-            except Exception as exc:
-                err = str(exc)
-                if "API_KEY_INVALID" in err or "invalid" in err.lower():
-                    st.error("❌ API Key មិនត្រឹមត្រូវ។ សូមពិនិត្យម្តងទៀត។")
-                elif "google-genai" in err:
-                    st.error(f"❌ {err}")
-                    st.code("pip install google-genai", language="bash")
-                else:
-                    st.error(f"❌ មានបញ្ហា: {exc}")
-
-        # Show download buttons persistently from session_state
-        if st.session_state.translation_result is not None:
-            result_bytes, saved_out_name, updated_glossary = st.session_state.translation_result
             st.success(
                 f"🎉 ការបកប្រែជោគជ័យ! "
-                f"Glossary ឥឡូវនេះមាន **{len(updated_glossary)} ពាក្យ** — "
+                f"Glossary ឥឡូវនេះមាន **{glossary_count} ពាក្យ** — "
                 f"Save វាក្នុង Sidebar ដើម្បីប្រើ EP បន្ទាប់!"
             )
             col_dl, col_gl = st.columns(2)
             with col_dl:
-                st.download_button(
-                    label="📥 ទាញយក SRT ខ្មែរ",
-                    data=result_bytes,
-                    file_name=saved_out_name,
-                    mime="text/plain",
-                    key="dl_srt_result",
-                )
+                if result_bytes:
+                    st.download_button(
+                        label="📥 ទាញយក SRT ខ្មែរ",
+                        data=result_bytes,
+                        file_name=out_name,
+                        mime="text/plain",
+                        key="dl_srt_result",
+                    )
             with col_gl:
-                gl_json = json.dumps(
-                    updated_glossary, ensure_ascii=False, indent=2
-                ).encode("utf-8")
-                st.download_button(
-                    label="💾 Save Glossary សម្រាប់ EP បន្ទាប់",
-                    data=gl_json,
-                    file_name="series_glossary.json",
-                    mime="application/json",
-                    key="dl_glossary_result",
+                if glossary_bytes:
+                    st.download_button(
+                        label="💾 Save Glossary សម្រាប់ EP បន្ទាប់",
+                        data=glossary_bytes,
+                        file_name="series_glossary.json",
+                        mime="application/json",
+                        key="dl_glossary_result",
+                    )
+
+            if st.button("🆕 បកប្រែ EP ផ្សេងទៀត", key="new_translate_job"):
+                del st.query_params["job_translate"]
+                st.rerun()
+
+    else:
+        uploaded_srt_raw = st.file_uploader(
+            "📂 ជ្រើស .srt (English)",
+            key="translate_uploader",
+        )
+
+        uploaded_srt = None
+        if uploaded_srt_raw is not None:
+            if is_valid_srt_filename(uploaded_srt_raw.name):
+                uploaded_srt = uploaded_srt_raw
+            else:
+                st.error(
+                    f"❌ ឯកសារ **{uploaded_srt_raw.name}** មិនមែនជា `.srt` ទេ។ "
+                    "សូមជ្រើស file ដែលមាន extension `.srt`។"
                 )
+
+        if uploaded_srt:
+            base = os.path.splitext(uploaded_srt.name)[0]
+            out_name = f"{base}_KH.srt"
+            st.info(f"📄 **{uploaded_srt.name}**  →  **{out_name}**")
+
+            st.markdown("**🏷️ ជ្រើសរើស Tags ដែលចង់លុប:**")
+            tc1, tc2, tc3 = st.columns(3)
+            with tc1:
+                opt_ass = st.checkbox("`{\\an8}` ASS/SSA tags", value=True, key="opt_ass")
+            with tc2:
+                opt_html = st.checkbox("`<i>` `</i>` HTML tags", value=True, key="opt_html")
+            with tc3:
+                opt_brackets = st.checkbox("`[...]` Bracket text", value=True, key="opt_brackets")
+
+            if st.button("🔄 ចាប់ផ្តើមបកប្រែ", type="primary", key="btn_translate"):
+                key = gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
+                if not key:
+                    st.error(
+                        "❌ សូមដាក់ **Google Gemini API Key** ក្នុង Sidebar។\n\n"
+                        "យក Key ឥតគិតថ្លៃ: https://aistudio.google.com"
+                    )
+                    st.stop()
+
+                job_id = new_job_id()
+                write_job_status(
+                    job_id, status="running", progress=0.0,
+                    message="⏳ កំពុងចាប់ផ្តើម...",
+                )
+                t = threading.Thread(
+                    target=_run_translate_job,
+                    args=(
+                        job_id, uploaded_srt.read(), key,
+                        opt_ass, opt_html, opt_brackets,
+                        selected_model, dict(st.session_state.glossary), out_name,
+                    ),
+                    daemon=True,
+                )
+                t.start()
+                st.query_params["job_translate"] = job_id
+                st.rerun()
 
 
 # =====================================================================
@@ -668,91 +858,92 @@ with tab_translate:
 with tab_tts:
     st.subheader("🎧 SRT → សំឡេង MP3 (Audio Sync)")
 
-    # NOTE: `type=` omitted here too — see comment above the translation
-    # tab's uploader for why (iOS Safari `.srt` accept-filter bug).
-    tts_file_raw = st.file_uploader(
-        "📂 ជ្រើស .srt (ខ្មែរ ឬ ភាសាដែលចង់ស្តាប់)",
-        key="tts_uploader",
-    )
+    job_tts_id = st.query_params.get("job_tts")
 
-    tts_file = None
-    if tts_file_raw is not None:
-        if is_valid_srt_filename(tts_file_raw.name):
-            tts_file = tts_file_raw
-        else:
-            st.error(
-                f"❌ ឯកសារ **{tts_file_raw.name}** មិនមែនជា `.srt` ទេ។ "
-                "សូមជ្រើស file ដែលមាន extension `.srt`។"
+    if job_tts_id:
+        status = read_job_status(job_tts_id)
+
+        if status is None:
+            st.warning("⚠️ រកមិនឃើញការងារនេះទេ (server restart ឬផុតកំណត់)។ សូមចាប់ផ្តើមឡើងវិញ។")
+            if st.button("🆕 ការងារថ្មី", key="reset_tts_missing"):
+                del st.query_params["job_tts"]
+                st.rerun()
+
+        elif status.get("status") == "running":
+            st.info(
+                "🔄 កំពុងបំប្លែងនៅលើ server... \n\n"
+                "✅ អ្នកអាចប្តូរទៅ tab ឬ app ផ្សេងបានដោយសុវត្ថិភាព — "
+                "ការងារនឹងបន្តដំណើរការ ហើយលទ្ធផលនឹងបង្ហាញពេលអ្នកត្រឡប់មកវិញ។"
             )
+            st.progress(status.get("progress", 0.0))
+            st.markdown('<meta http-equiv="refresh" content="3">', unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        voice_opt = st.selectbox(
-            "សំឡេង",
-            ["km-KH-PisethNeural (ប្រុស)", "km-KH-SreymomNeural (ស្រី)"],
-            index=1,
-        )
-    with c2:
-        speed = st.slider("ល្បឿន (%)", -50, 100, 45, step=5)
-    with c3:
-        pitch_val = st.slider("Pitch (Hz)", -50, 50, 18, step=1)
+        elif status.get("status") == "error":
+            st.error(f"❌ មានបញ្ហា: {status.get('error', 'Unknown error')}")
+            if st.button("🔁 ព្យាយាមម្តងទៀត", key="retry_tts"):
+                del st.query_params["job_tts"]
+                st.rerun()
 
-    voice_id  = voice_opt.split(" ")[0]
-    rate_str  = f"{speed:+d}%"
-    pitch_str = f"{pitch_val:+d}Hz"
-
-    if tts_file:
-        base_tts = os.path.splitext(tts_file.name)[0]
-        mp3_name = f"{base_tts}.mp3"
-
-        if st.button("🎙️ ចាប់ផ្តើមបំប្លែង", type="primary", key="btn_tts"):
-            # Clear previous result when starting new conversion
-            st.session_state.tts_result = None
-            with st.spinner("កំពុងបំប្លែង..."):
-                try:
-                    srt_bytes = tts_file.read()
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result_path = loop.run_until_complete(
-                        process_srt_to_mp3(srt_bytes, voice_id, rate_str, pitch_str)
-                    )
-                    with open(result_path, "rb") as f:
-                        audio_bytes = f.read()
-                    os.remove(result_path)
-                    # Store result persistently
-                    st.session_state.tts_result = (audio_bytes, mp3_name)
-                except Exception as exc:
-                    import traceback
-                    tb = traceback.format_exc()
-                    # Extract line number from traceback
-                    line_match = re.findall(r'line (\d+)', tb)
-                    line_info = f" (line {line_match[-1]})" if line_match else ""
-                    err_msg = str(exc)
-
-                    if "No audio was received" in err_msg or "no audio" in err_msg.lower():
-                        st.error(
-                            f"❌ មានបញ្ហា{line_info}: No audio was received. "
-                            f"Please verify that your parameters are correct.\n\n"
-                            f"**សាកល្បង:**\n"
-                            f"- ល្បឿន (Rate): `{rate_str}` — សាកល្បងប្ដូរទៅ `+0%`\n"
-                            f"- Pitch: `{pitch_str}` — សាកល្បងប្ដូរទៅ `+0Hz`\n"
-                            f"- សំឡេង: `{voice_id}` — ប្ដូរទៅ voice ម្យ៉ាងទៀត\n"
-                            f"- ពិនិត្យ internet connection ទៅ Microsoft Edge TTS server"
-                        )
-                    else:
-                        st.error(f"❌ មានបញ្ហា{line_info}: {exc}")
-
-                    with st.expander("🔍 Technical Details (Traceback)"):
-                        st.code(tb, language="python")
-
-        # Show audio player and download button persistently from session_state
-        if st.session_state.tts_result is not None:
-            audio_bytes, saved_mp3_name = st.session_state.tts_result
+        elif status.get("status") == "done":
+            mp3_name = status.get("out_name", "result.mp3")
+            audio_bytes = load_job_file(job_tts_id, "result.mp3")
             st.success("ការបំប្លែងជោគជ័យ! សំឡេងដើរទាន់អក្សរហើយ!")
-            st.audio(audio_bytes, format="audio/mp3")
-            st.download_button(
-                "📥 ទាញយក MP3",
-                audio_bytes,
-                file_name=saved_mp3_name,
-                key="dl_mp3_result",
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button(
+                    "📥 ទាញយក MP3", audio_bytes, file_name=mp3_name, key="dl_mp3_result",
+                )
+            if st.button("🆕 បំប្លែងឯកសារផ្សេងទៀត", key="new_tts_job"):
+                del st.query_params["job_tts"]
+                st.rerun()
+
+    else:
+        tts_file_raw = st.file_uploader(
+            "📂 ជ្រើស .srt (ខ្មែរ ឬ ភាសាដែលចង់ស្តាប់)",
+            key="tts_uploader",
+        )
+
+        tts_file = None
+        if tts_file_raw is not None:
+            if is_valid_srt_filename(tts_file_raw.name):
+                tts_file = tts_file_raw
+            else:
+                st.error(
+                    f"❌ ឯកសារ **{tts_file_raw.name}** មិនមែនជា `.srt` ទេ។ "
+                    "សូមជ្រើស file ដែលមាន extension `.srt`។"
+                )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            voice_opt = st.selectbox(
+                "សំឡេង",
+                ["km-KH-PisethNeural (ប្រុស)", "km-KH-SreymomNeural (ស្រី)"],
+                index=1,
             )
+        with c2:
+            speed = st.slider("ល្បឿន (%)", -50, 100, 45, step=5)
+        with c3:
+            pitch_val = st.slider("Pitch (Hz)", -50, 50, 18, step=1)
+
+        voice_id  = voice_opt.split(" ")[0]
+        rate_str  = f"{speed:+d}%"
+        pitch_str = f"{pitch_val:+d}Hz"
+
+        if tts_file:
+            base_tts = os.path.splitext(tts_file.name)[0]
+            mp3_name = f"{base_tts}.mp3"
+
+            if st.button("🎙️ ចាប់ផ្តើមបំប្លែង", type="primary", key="btn_tts"):
+                job_id = new_job_id()
+                write_job_status(
+                    job_id, status="running", progress=0.0,
+                    message="⏳ កំពុងបំប្លែង...",
+                )
+                t = threading.Thread(
+                    target=_run_tts_job,
+                    args=(job_id, tts_file.read(), voice_id, rate_str, pitch_str, mp3_name),
+                    daemon=True,
+                )
+                t.start()
+                st.query_params["job_tts"] = job_id
+                st.rerun()
